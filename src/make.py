@@ -1,73 +1,102 @@
 import json
-import os
-import subprocess
-import sys
+import pathlib
 
+import list_mappings
+import mappings_to_heatmaps
+import substitute
 
-def find_file_with_suffix(suffix, folder):
-    """find a file with the given suffix in the folder"""
-    for f in os.listdir(folder):
-        if f.endswith(suffix):
-            return f
-    return None
+import parse
+
+ATTACK_8_2 = "8_2"
+ATTACK_9_0 = "9_0"
+ATTACK_10_1 = "10_1"
+
+R4 = "nist800_53_r4"
+R5 = "nist800_53_r5"
+
+framework_id_lookup = {
+    R4: "NIST 800-53 Revision 4",
+    R5: "NIST 800-53 Revision 5"
+}
 
 
 def main():
     """rebuild all control frameworks from the input data"""
 
-    for attack_version in ["v8.2", "v9.0"]:
-        for framework in ["nist800-53-r4", "nist800-53-r5"]:
-            # move to the framework folder
-            versioned_folder = f"ATT&CK-{attack_version}"
-            framework_folder = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frameworks",
-                                            versioned_folder, framework)
-            os.chdir(framework_folder)
+    for attack_version in [ATTACK_8_2, ATTACK_9_0, ATTACK_10_1]:
+        for framework in [R4, R5]:
+            # TODO: Lots of variable setting. Clean up
+            versioned_folder = f"attack_{attack_version}"
+            dashed_framework = framework.replace('_', '-')
+            dashed_attack_version = attack_version.replace('_', '-')
 
-            # read the framework config
-            config_path = os.path.join("input", "config.json")
-            if not os.path.exists(config_path):
-                print("WARNING: framework has no config file, skipping")
-                os.chdir(os.path.join("..", "..", "..", "src"))
-                continue
-            with open(config_path, "r") as f:
-                config = json.load(f)
+            framework_id = framework_id_lookup[framework]
+            project_folder = pathlib.Path(__file__).absolute().parent.parent
+            framework_folder = project_folder / "frameworks" / versioned_folder / framework
 
-            # build the controls and mappings STIX
-            subprocess.run([sys.executable, "parse.py"])
-            os.chdir(os.path.join("..", "..", "..", "src"))
+            dist_folder = project_folder / "dist"
+            dist_prefix = f"attack-{dashed_attack_version}-to-{dashed_framework}-"
+            attack_version_string = "v" + attack_version.replace("_", ".")
 
-            # find the mapping and control files that were generated
-            controls_file = find_file_with_suffix("-controls.json", os.path.join(framework_folder, "stix"))
-            mappings_file = find_file_with_suffix("-mappings.json", os.path.join(framework_folder, "stix"))
+            # Create the dist/ directory if not already present, if already present, do not raise an error.
+            dist_folder.mkdir(exist_ok=True)
+
+            attack_data = project_folder / "data" / "attack" / f"enterprise-attack-{attack_version_string}.json"
+            with attack_data.open("r") as f:
+                attack_data = json.load(f)["objects"]
+
+            in_controls = project_folder / "data" / "controls" / f"{dashed_framework}-controls.tsv"
+            in_mappings = (project_folder / "data" / "mappings" /
+                           f"attack-{dashed_attack_version}-to-{dashed_framework}-mappings.tsv")
+            out_controls = framework_folder / "stix" / f"{dashed_framework}-controls.json"
+            out_mappings = framework_folder / "stix" / f"{dashed_framework}-mappings.json"
+
+            parse.main(in_controls=in_controls,
+                       in_mappings=in_mappings,
+                       out_controls=out_controls,
+                       out_mappings=out_mappings,
+                       framework_id=framework_id,
+                       attack_data=attack_data)
+
+            controls = framework_folder / "stix" / f"{dashed_framework}-controls.json"
+            with controls.open("r") as f:
+                controls = json.load(f)["objects"]
+
+            mappings = framework_folder / "stix" / f"{dashed_framework}-mappings.json"
+            with mappings.open("r") as f:
+                mappings = json.load(f)["objects"]
+
+            out_enterprise = framework_folder / "stix" / f"{dashed_framework}-enterprise-attack.json"
+            out_layers = framework_folder / "layers"
+            out_xlsx = dist_folder / f"{dist_prefix}mappings.xlsx"
 
             # run the utility scripts
-            subprocess.run([
-                sys.executable, "mappings_to_heatmaps.py",
-                "-controls", os.path.join(framework_folder, "stix", controls_file),
-                "-mappings", os.path.join(framework_folder, "stix", mappings_file),
-                "-output", os.path.join(framework_folder, "layers"),
-                "-domain", config["attack_domain"],
-                "-version", config["attack_version"],
-                "-framework", framework,
-                "--clear",
-                "--build-directory"
-            ])
-            subprocess.run([
-                sys.executable, "substitute.py",
-                "-controls", os.path.join(framework_folder, "stix", controls_file),
-                "-mappings", os.path.join(framework_folder, "stix", mappings_file),
-                "-output", os.path.join(framework_folder, "stix", f"{framework}-enterprise-attack.json"),
-                "-domain", config["attack_domain"],
-                "-version", config["attack_version"]
-            ])
-            subprocess.run([
-                sys.executable, "list_mappings.py",
-                "-controls", os.path.join(framework_folder, "stix", controls_file),
-                "-mappings", os.path.join(framework_folder, "stix", mappings_file),
-                "-output", os.path.join(framework_folder, f"{framework}-mappings.xlsx"),
-                "-domain", config["attack_domain"],
-                "-version", config["attack_version"]
-            ])
+            mappings_to_heatmaps.main(
+                framework=framework,
+                attack_data=attack_data,
+                controls=controls,
+                mappings=mappings,
+                domain="enterprise-attack",
+                version=attack_version_string,
+                output=out_layers,
+                clear=True,
+                build_dir=True
+            )
+
+            substitute.main(
+                attack_data=attack_data,
+                controls=controls,
+                mappings=mappings,
+                allow_unmapped=False,
+                output=out_enterprise
+            )
+
+            list_mappings.main(
+                attack_data=attack_data,
+                controls=controls,
+                mappings=mappings,
+                output=out_xlsx
+            )
 
 
 if __name__ == "__main__":
